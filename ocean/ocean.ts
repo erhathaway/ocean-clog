@@ -97,7 +97,7 @@ export function createOcean(opts: OceanOptions): Ocean {
   return {
     async migrate() {
       await enableForeignKeys(opts.db);
-      // Execute ocean/migrations/schema.sql via your migration system.
+      // Run Drizzle migrations generated from ocean/db/schema.ts.
     },
 
     registerClog(clog: Clog) {

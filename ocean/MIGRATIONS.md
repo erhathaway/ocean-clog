@@ -1,10 +1,6 @@
 # Ocean migrations
 
-Ocean ships a single SQL schema file:
-
-- `ocean/migrations/schema.sql`
-
-You should apply it using your existing migration system (recommended), or by running the SQL at startup for dev/test.
+Ocean uses Drizzle with a typed schema in `ocean/db/schema.ts`. Generate and apply migrations from that schema.
 
 ## Required: enable foreign keys (SQLite/libSQL)
 
@@ -27,20 +23,21 @@ on each connection before executing any queries.
 
 ## Applying the schema
 
-### Option A: Migration tool (recommended)
-Put `ocean/migrations/schema.sql` into your migrations directory and run it once.
+### Drizzle migrations (Bun + libSQL)
+Generate migrations from the typed schema:
 
-### Option B: Apply at startup (dev/test)
-Pseudo-code:
+```sh
+bunx drizzle-kit generate --config ocean/drizzle.config.ts
+```
+
+Apply migrations at startup:
 
 ```ts
-import fs from "node:fs/promises";
-import { sql } from "drizzle-orm";
-import { enableForeignKeys } from "./ocean/db/db.js";
+import { migrate } from "drizzle-orm/libsql/migrator";
 
-await enableForeignKeys(db);
-const schemaSql = await fs.readFile(new URL("./ocean/migrations/schema.sql", import.meta.url), "utf8");
-await db.execute(sql.raw(schemaSql));
+await migrate(db, {
+  migrationsFolder: new URL("./ocean/db/drizzle", import.meta.url).pathname,
+});
 ```
 
 ## Notes on future migrations

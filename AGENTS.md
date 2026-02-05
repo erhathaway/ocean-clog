@@ -1,6 +1,7 @@
 # Agents in Ocean
 
 **IMPORTANT:** Do not work on /app only work in /ocean. 
+**IMPORTANT:** Ocean uses Bun + libSQL + Drizzle. When `ocean/db/schema.ts` changes, always run `bunx drizzle-kit generate --config ocean/drizzle.config.ts` and include the generated migration output in your changes.
 
 This document explains the **spirit** and **shape** of “agents” in Ocean: what they are, how they run, how they persist state, and why the system is designed the way it is.
 

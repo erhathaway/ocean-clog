@@ -1,7 +1,8 @@
-import { sql } from "drizzle-orm";
+import { lt } from "drizzle-orm";
 import { randomId } from "../core/ids.js";
 import { nowMs } from "../core/time.js";
 import type { SqlClient } from "../db/db.js";
+import { events } from "../db/schema.js";
 
 export type EventScope =
   | { kind: "global" }
@@ -23,14 +24,20 @@ export async function emitEvent(db: SqlClient, scope: EventScope, type: string, 
   const run_id = scope.kind === "run" || scope.kind === "tick" ? scope.runId : null;
   const tick_id = scope.kind === "tick" ? scope.tickId : null;
 
-  await db.execute(
-    sql`INSERT INTO events(id, ts, scope_kind, session_id, run_id, tick_id, type, payload)
-        VALUES (${id}, ${ts}, ${scope_kind}, ${session_id}, ${run_id}, ${tick_id}, ${type}, ${JSON.stringify(payload)})`,
-  );
+  await db.insert(events).values({
+    id,
+    ts,
+    scope_kind,
+    session_id,
+    run_id,
+    tick_id,
+    type,
+    payload,
+  });
 }
 
 export async function gcEventsByTtl(db: SqlClient, ttlMs: number): Promise<number> {
   const cutoff = nowMs() - ttlMs;
-  const res: any = await db.execute(sql`DELETE FROM events WHERE ts < ${cutoff}`);
-  return res?.changes ?? res?.rowsAffected ?? 0;
+  const res: any = await db.delete(events).where(lt(events.ts, cutoff));
+  return res?.changes ?? res?.rowsAffected ?? res?.rowCount ?? 0;
 }
