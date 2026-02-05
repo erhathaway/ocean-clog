@@ -1,0 +1,49 @@
+# Dependencies
+node_modules
+
+# Build output
+.output
+.vercel
+.netlify
+.wrangler
+.svelte-kit
+build
+dist
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.*
+!.env.example
+!.env.test
+
+# Vite
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+
+# Testing
+test-results
+playwright-report
+
+# Paraglide
+app/src/lib/paraglide
+app/project.inlang/cache/
+
+# SQLite
+*.db
+
+# Storybook
+*storybook.log
+storybook-static
+
+# Lock files (bun)
+# bun.lockb is binary - uncomment below to ignore it
+# bun.lockb
+
+# Editor
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
