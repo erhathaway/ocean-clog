@@ -1,0 +1,10 @@
+{
+  "name": "ocean",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "@libsql/client": "^0.15.5",
+    "drizzle-orm": "^0.36.4",
+    "drizzle-kit": "^0.30.4"
+  }
+}

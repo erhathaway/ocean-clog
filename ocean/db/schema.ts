@@ -1,18 +1,4 @@
-import { customType } from "drizzle-orm";
 import { foreignKey, index, integer, primaryKey, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
-
-const jsonText = customType<{ data: unknown }>({
-  dataType() {
-    return "text";
-  },
-  toDriver(value) {
-    return JSON.stringify(value);
-  },
-  fromDriver(value) {
-    if (value === null || value === undefined || value === "") return null;
-    return JSON.parse(String(value));
-  },
-});
 
 export const oceanSessions = sqliteTable("ocean_sessions", {
   session_id: text("session_id").primaryKey(),
@@ -29,7 +15,7 @@ export const runs = sqliteTable(
       .notNull()
       .references(() => oceanSessions.session_id, { onDelete: "cascade" }),
     status: text("status").notNull(),
-    state: jsonText("state").notNull(),
+    state: text("state", { mode: "json" }).notNull(),
   },
   (t) => ({
     idx_runs_session: index("idx_runs_session").on(t.session_id),
@@ -53,7 +39,7 @@ export const oceanTicks = sqliteTable(
 
 export const oceanStorageGlobal = sqliteTable("ocean_storage_global", {
   clog_id: text("clog_id").primaryKey(),
-  value: jsonText("value").notNull(),
+  value: text("value", { mode: "json" }).notNull(),
   updated_ts: integer("updated_ts").notNull(),
 });
 
@@ -64,7 +50,7 @@ export const oceanStorageSession = sqliteTable(
     session_id: text("session_id")
       .notNull()
       .references(() => oceanSessions.session_id, { onDelete: "cascade" }),
-    value: jsonText("value").notNull(),
+    value: text("value", { mode: "json" }).notNull(),
     updated_ts: integer("updated_ts").notNull(),
   },
   (t) => ({
@@ -80,7 +66,7 @@ export const oceanStorageRun = sqliteTable(
     run_id: text("run_id")
       .notNull()
       .references(() => runs.run_id, { onDelete: "cascade" }),
-    value: jsonText("value").notNull(),
+    value: text("value", { mode: "json" }).notNull(),
     updated_ts: integer("updated_ts").notNull(),
   },
   (t) => ({
@@ -96,7 +82,7 @@ export const oceanStorageTick = sqliteTable(
     run_id: text("run_id").notNull(),
     tick_id: text("tick_id").notNull(),
     row_id: text("row_id").notNull(),
-    value: jsonText("value").notNull(),
+    value: text("value", { mode: "json" }).notNull(),
     updated_ts: integer("updated_ts").notNull(),
   },
   (t) => ({
@@ -121,7 +107,7 @@ export const events = sqliteTable(
     run_id: text("run_id"),
     tick_id: text("tick_id"),
     type: text("type").notNull(),
-    payload: jsonText("payload").notNull(),
+    payload: text("payload", { mode: "json" }).notNull(),
   },
   (t) => ({
     idx_events_id: uniqueIndex("idx_events_id").on(t.id),
