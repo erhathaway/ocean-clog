@@ -96,8 +96,10 @@ export async function acquireRun(
   const now = nowMs();
   const lockExpires = now + lockMs;
 
-  // Find a pending or waiting (wake_at <= now) run that is not locked (or lock expired)
-  // Use a subquery to atomically pick one row
+  // Atomic single-row lock acquisition. The outer WHERE duplicates the subquery
+  // conditions intentionally: the subquery SELECT ... LIMIT 1 picks one eligible
+  // run_id, and the outer WHERE re-checks the same predicates so the UPDATE is
+  // a single atomic statement (no TOCTOU race between SELECT and UPDATE).
   const result = await db
     .update(runs)
     .set({
@@ -109,7 +111,6 @@ export async function acquireRun(
       and(
         or(eq(runs.status, "pending"), and(eq(runs.status, "waiting"), lte(runs.wake_at, now))),
         or(isNull(runs.locked_by), lte(runs.lock_expires_at, now)),
-        // Use rowid trick to limit to one row
         eq(
           runs.run_id,
           sql`(SELECT ${runs.run_id} FROM ${runs} WHERE (${runs.status} = 'pending' OR (${runs.status} = 'waiting' AND ${runs.wake_at} <= ${now})) AND (${runs.locked_by} IS NULL OR ${runs.lock_expires_at} <= ${now}) LIMIT 1)`,
@@ -161,21 +162,6 @@ export async function releaseRun(
   if (patch.wake_at !== undefined) sets.wake_at = patch.wake_at;
   if (patch.last_error !== undefined) sets.last_error = patch.last_error;
   if (patch.pending_input !== undefined) sets.pending_input = patch.pending_input;
-
-  await db.update(runs).set(sets).where(eq(runs.run_id, runId));
-}
-
-export async function updateRunState(db: SqlClient, runId: string, patch: Partial<{ status: string; state: unknown }>): Promise<void> {
-  const sets: Partial<{ status: string; state: unknown; updated_ts: number }> = {
-    updated_ts: nowMs(),
-  };
-
-  if (patch.status !== undefined) {
-    sets.status = patch.status;
-  }
-  if (patch.state !== undefined) {
-    sets.state = patch.state;
-  }
 
   await db.update(runs).set(sets).where(eq(runs.run_id, runId));
 }

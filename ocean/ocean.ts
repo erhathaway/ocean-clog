@@ -96,6 +96,7 @@ async function applyOutcome(db: SqlClient, run: RunRow, outcome: TickOutcome): P
         attempt: 0,
         last_error: null,
         wake_at: null,
+        pending_input: hasPendingInput ? undefined : null,
       });
       break;
     }
@@ -105,6 +106,7 @@ async function applyOutcome(db: SqlClient, run: RunRow, outcome: TickOutcome): P
         attempt: 0,
         last_error: null,
         wake_at: null,
+        pending_input: null,
       });
       break;
     }
@@ -124,6 +126,7 @@ async function applyOutcome(db: SqlClient, run: RunRow, outcome: TickOutcome): P
         attempt: 0,
         wake_at: outcome.wakeAt,
         last_error: null,
+        pending_input: null,
       });
       break;
     }
@@ -135,6 +138,7 @@ async function applyOutcome(db: SqlClient, run: RunRow, outcome: TickOutcome): P
           attempt: nextAttempt,
           last_error: outcome.error,
           wake_at: null,
+          pending_input: null,
         });
       } else {
         await releaseRun(db, run.run_id, {
@@ -151,6 +155,7 @@ async function applyOutcome(db: SqlClient, run: RunRow, outcome: TickOutcome): P
         status: "failed",
         last_error: outcome.error,
         wake_at: null,
+        pending_input: null,
       });
       break;
     }
