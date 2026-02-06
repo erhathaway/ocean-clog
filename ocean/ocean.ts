@@ -295,6 +295,7 @@ export function createOcean(opts: OceanOptions): Ocean {
         await releaseRun(opts.db, run.run_id, {
           status: "failed",
           last_error: "no onAdvance handler",
+          pending_input: null,
         });
         return { advanced: 1, results: [{ runId: run.run_id, outcome: "failed" }] };
       }

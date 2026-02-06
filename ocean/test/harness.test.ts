@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { createTestEnv, type TestEnv } from "./harness.js";
 import type { Clog, TickOutcome } from "../clogs/types.js";
+import { acquireRun, getRun } from "../engine/run.js";
 
 // ---------------------------------------------------------------------------
 // Test clog factories
@@ -165,6 +166,61 @@ describe("state machine basics", () => {
     });
     const run = await env.ocean.getRun(runId);
     expect(run?.maxAttempts).toBe(3);
+  });
+
+  it("createRun with falsy-but-defined input (0, false, empty string) starts as pending", async () => {
+    env = await createTestEnv({ clogs: [counterClog] });
+
+    // input: 0
+    const { runId: r1 } = await env.ocean.createRun({
+      sessionId: "s1",
+      clogId: "counter",
+      input: 0,
+    });
+    expect((await env.ocean.getRun(r1))?.status).toBe("pending");
+
+    // input: false
+    const { runId: r2 } = await env.ocean.createRun({
+      sessionId: "s1",
+      clogId: "counter",
+      input: false,
+    });
+    expect((await env.ocean.getRun(r2))?.status).toBe("pending");
+
+    // input: ""
+    const { runId: r3 } = await env.ocean.createRun({
+      sessionId: "s1",
+      clogId: "counter",
+      input: "",
+    });
+    expect((await env.ocean.getRun(r3))?.status).toBe("pending");
+
+    // All three should be processable
+    const total = await env.cron.drain();
+    expect(total).toBe(3);
+
+    // Verify handler received the actual falsy values
+    const events = await env.ocean.readEvents({ scope: { kind: "global" } });
+    const ticks = events.filter((e) => e.type === "counter.tick");
+    expect(ticks.length).toBe(3);
+    // 0 and false aren't strings, so action defaults to "increment" (the ?? fallback)
+    // "" IS a string, so action = "" which hits the default case → ok
+  });
+
+  it("createRun with input: null starts as pending with null pending_input", async () => {
+    env = await createTestEnv({ clogs: [counterClog] });
+    const { runId } = await env.ocean.createRun({
+      sessionId: "s1",
+      clogId: "counter",
+      input: null,
+    });
+
+    const run = await env.ocean.getRun(runId);
+    expect(run?.status).toBe("pending");
+
+    // Handler receives null, defaults to "increment" action
+    await env.cron.drain();
+    expect((await env.ocean.getRun(runId))?.status).toBe("idle");
   });
 
   it("basic signal → advance → idle cycle with events", async () => {
@@ -496,6 +552,42 @@ describe("signal semantics", () => {
     expect((processed[1].payload as any).input).toBe("external-data");
   });
 
+  it("multiple signals before advance — last write wins", async () => {
+    env = await createTestEnv({ clogs: [counterClog] });
+    const { runId } = await env.ocean.createRun({
+      sessionId: "s1",
+      clogId: "counter",
+    });
+
+    // Send 3 signals — only the last value should be seen by the handler
+    await env.ocean.signal(runId, "first");
+    await env.ocean.signal(runId, "second");
+    await env.ocean.signal(runId, "third");
+
+    const run = await env.ocean.getRun(runId);
+    expect(run?.status).toBe("pending");
+
+    await env.cron.drain();
+    expect((await env.ocean.getRun(runId))?.status).toBe("idle");
+
+    const events = await env.ocean.readEvents({ scope: { kind: "global" } });
+    const ticks = events.filter((e) => e.type === "counter.tick");
+    expect(ticks.length).toBe(1);
+    // Handler should have received the last signal's input
+    expect((ticks[0].payload as any).input).toBe("third");
+  });
+
+  it("signal on non-existent runId — silent no-op", async () => {
+    env = await createTestEnv({ clogs: [counterClog] });
+
+    // Should not throw
+    await env.ocean.signal("run_does_not_exist", "hello");
+
+    // Nothing to advance
+    const result = await env.ocean.advance();
+    expect(result.advanced).toBe(0);
+  });
+
   it("signal with identical payload during processing → detected as new input", async () => {
     // After consumePendingInput, DB pending_input is null.
     // A signal with any payload (even identical) sets it to non-null.
@@ -719,6 +811,80 @@ describe("retry & backoff", () => {
     }
   });
 
+  it("backoff cap at 60s — large attempt numbers don't exceed cap", async () => {
+    env = await createTestEnv({ clogs: [counterClog] });
+    const { runId } = await env.ocean.createRun({
+      sessionId: "s1",
+      clogId: "counter",
+      input: "fail",
+      retry: { maxAttempts: 10 },
+    });
+
+    // Exhaust attempts up to attempt 6 where cap kicks in
+    // backoff(1)=2s, backoff(2)=4s, backoff(3)=8s, backoff(4)=16s, backoff(5)=32s, backoff(6)=64s→60s
+    await env.cron.drain(); // attempt 0 → waiting
+    env.clock.advance(2_500);
+    await env.cron.drain(); // attempt 1 → waiting
+    env.clock.advance(4_500);
+    await env.cron.drain(); // attempt 2 → waiting
+    env.clock.advance(8_500);
+    await env.cron.drain(); // attempt 3 → waiting
+    env.clock.advance(16_500);
+    await env.cron.drain(); // attempt 4 → waiting
+    env.clock.advance(32_500);
+    await env.cron.drain(); // attempt 5 → waiting
+
+    let run = await env.ocean.getRun(runId);
+    expect(run?.attempt).toBe(6);
+    expect(run?.status).toBe("waiting");
+
+    // backoff(6) = min(1000*2^6, 60000) = min(64000, 60000) = 60000
+    // 59999ms — should NOT wake
+    env.clock.advance(59_999);
+    expect(await env.cron.drain()).toBe(0);
+
+    // 1 more ms — exactly at 60000ms cap
+    env.clock.advance(1);
+    expect(await env.cron.drain()).toBe(1);
+    run = await env.ocean.getRun(runId);
+    expect(run?.attempt).toBe(7);
+  });
+
+  it("signal during final retry attempt — terminal overrides signal", async () => {
+    // When a signal arrives during the final retry (which will exhaust maxAttempts),
+    // the run goes to "failed" terminal state and the signal is lost.
+    const ctx: { ocean?: any; targetRunId?: string; signaled: boolean } = { signaled: false };
+    const retrySignalClog = callbackClog("retry-signal", async (input, { tools }) => {
+      if (!ctx.signaled && ctx.ocean && ctx.targetRunId) {
+        ctx.signaled = true;
+        await ctx.ocean.signal(ctx.targetRunId, "rescue-signal");
+      }
+      await tools({
+        name: "ocean.events.emit",
+        input: { scope: { kind: "global" }, type: "processed", payload: { input } },
+      });
+      return { status: "retry", error: "still failing" };
+    });
+
+    env = await createTestEnv({ clogs: [retrySignalClog] });
+    ctx.ocean = env.ocean;
+
+    const { runId } = await env.ocean.createRun({
+      sessionId: "s1",
+      clogId: "retry-signal",
+      input: "start",
+      retry: { maxAttempts: 1 }, // Only 1 attempt — first failure is terminal
+    });
+    ctx.targetRunId = runId;
+
+    await env.cron.drain();
+
+    // Run should be failed despite the signal — terminal state wins
+    const run = await env.ocean.getRun(runId);
+    expect(run?.status).toBe("failed");
+    expect(run?.lastError).toBe("still failing");
+  });
+
   it("retry with backoff — fails after maxAttempts", async () => {
     env = await createTestEnv({ clogs: [counterClog] });
     const { runId } = await env.ocean.createRun({
@@ -790,7 +956,7 @@ describe("multi-instance", () => {
     expect((await w1.ocean.getRun(runB))?.status).toBe("idle");
   });
 
-  it("lock expiry — other instance steals expired lock", async () => {
+  it("stopped instance — other instance picks up pending work", async () => {
     env = await createTestEnv({ clogs: [counterClog], lockMs: 5_000 });
     const w1 = env.spawnInstance("w1");
     const w2 = env.spawnInstance("w2");
@@ -805,13 +971,44 @@ describe("multi-instance", () => {
     await env.cron.drain();
     expect((await w1.ocean.getRun(runId))?.status).toBe("idle");
 
-    // Signal again, then stop w1 to simulate crash (lock stays in DB)
+    // Signal again, then stop w1 to simulate crash
     await w1.ocean.signal(runId, "increment");
     w1.stop();
 
     // w2 should pick it up since w1 is dead (not advancing)
     const total = await env.cron.drain();
     expect(total).toBe(1);
+    expect((await w2.ocean.getRun(runId))?.status).toBe("idle");
+  });
+
+  it("lock expiry — stuck lock blocks until expired, then stolen", async () => {
+    env = await createTestEnv({ clogs: [counterClog], lockMs: 5_000 });
+    const w2 = env.spawnInstance("w2");
+
+    const { runId } = await w2.ocean.createRun({
+      sessionId: "s1",
+      clogId: "counter",
+      input: "increment",
+    });
+
+    // Directly acquire the lock as a simulated crashed instance "ghost"
+    const locked = await acquireRun(env.db, "ghost", 5_000);
+    expect(locked).not.toBeNull();
+    expect(locked!.run_id).toBe(runId);
+
+    // w2 tries to advance — should fail (lock held by "ghost")
+    const r1 = await w2.advance();
+    expect(r1.advanced).toBe(0);
+
+    // Advance clock just under lockMs — still blocked
+    env.clock.advance(4_999);
+    const r2 = await w2.advance();
+    expect(r2.advanced).toBe(0);
+
+    // Advance 1 more ms — lock expires, w2 steals it
+    env.clock.advance(1);
+    const r3 = await w2.advance();
+    expect(r3.advanced).toBe(1);
     expect((await w2.ocean.getRun(runId))?.status).toBe("idle");
   });
 
