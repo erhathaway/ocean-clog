@@ -14,11 +14,20 @@ export const runs = sqliteTable(
     session_id: text("session_id")
       .notNull()
       .references(() => oceanSessions.session_id, { onDelete: "cascade" }),
+    clog_id: text("clog_id").notNull(),
     status: text("status").notNull(),
     state: text("state", { mode: "json" }).notNull(),
+    locked_by: text("locked_by"),
+    lock_expires_at: integer("lock_expires_at"),
+    attempt: integer("attempt").notNull().default(0),
+    max_attempts: integer("max_attempts").notNull().default(3),
+    wake_at: integer("wake_at"),
+    pending_input: text("pending_input", { mode: "json" }),
+    last_error: text("last_error"),
   },
   (t) => ({
     idx_runs_session: index("idx_runs_session").on(t.session_id),
+    idx_runs_status_wake: index("idx_runs_status_wake").on(t.status, t.wake_at),
   }),
 );
 

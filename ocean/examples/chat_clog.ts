@@ -1,4 +1,4 @@
-import type { Clog } from "../clogs/types.js";
+import type { Clog, TickOutcome } from "../clogs/types.js";
 
 /**
  * A minimal chat clog demonstrating:
@@ -15,6 +15,18 @@ import type { Clog } from "../clogs/types.js";
  */
 export const chatClog: Clog = {
   id: "chat",
+
+  async onAdvance(input, { tools, attempt }): Promise<TickOutcome> {
+    const { userText } = (input as any) ?? {};
+    if (!userText) return { status: "ok" };
+
+    const assistantText = `You said: ${String(userText)}`;
+
+    // In a real clog you'd use tools to read/write storage, emit events, etc.
+    // This is a minimal demonstration of the onAdvance pattern.
+    return { status: "done", output: { assistantText } };
+  },
+
   endpoints: {
     /**
      * Address: clog.chat.onMessage

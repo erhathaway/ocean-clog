@@ -1,9 +1,10 @@
 import type { SqlClient } from "./db/db.js";
 import { enableForeignKeys } from "./db/db.js";
 import { migrate } from "drizzle-orm/libsql/migrator";
-import type { Clog } from "./clogs/types.js";
+import type { Clog, TickOutcome } from "./clogs/types.js";
 import { ClogRegistry } from "./clogs/registry.js";
-import { createRun, getRun } from "./engine/run.js";
+import { createRun, getRun, signalRun, acquireRun, releaseRun } from "./engine/run.js";
+import type { RunRow } from "./engine/run.js";
 import { beginTickEntity } from "./engine/tick.js";
 import { randomId } from "./core/ids.js";
 import { nowMs } from "./core/time.js";
@@ -14,64 +15,150 @@ import { createToolInvoker } from "./clogs/runtime.js";
 export type OceanOptions = {
   db: SqlClient;
 
+  instanceId?: string;
+  lockMs?: number;
+
   // audit log retention
   eventsTtlMs?: number;
   eventsGcMinIntervalMs?: number;
+};
+
+export type AdvanceResult = {
+  advanced: number;
+  results: Array<{ runId: string; outcome: string }>;
+};
+
+export type RunInfo = {
+  runId: string;
+  sessionId: string;
+  clogId: string;
+  status: string;
+  attempt: number;
+  maxAttempts: number;
+  wakeAt: number | null;
+  lastError: string | null;
+  createdTs: number;
+  updatedTs: number;
 };
 
 export type Ocean = {
   migrate: () => Promise<void>;
   registerClog: (clog: Clog) => void;
 
-  createRun: (args: { sessionId: string; initialState?: unknown }) => Promise<{ runId: string }>;
+  createRun: (args: {
+    sessionId: string;
+    clogId: string;
+    input?: unknown;
+    initialState?: unknown;
+    retry?: { maxAttempts?: number };
+  }) => Promise<{ runId: string }>;
   beginTick: (args: { runId: string; tickId?: string }) => Promise<{ tickId: string }>;
 
   callClog: (args: { runId: string; tickId: string; clogId: string; method: string; payload?: unknown }) => Promise<unknown>;
+
+  signal: (runId: string, input?: unknown) => Promise<void>;
+  advance: (opts?: { budgetMs?: number }) => Promise<AdvanceResult>;
+  getRun: (runId: string) => Promise<RunInfo | null>;
 
   readEvents: (args: { scope: ReadEventsScope; afterSeq?: number; limit?: number }) => Promise<EventRow[]>;
 
   gcEventsIfDue: () => Promise<void>;
 };
 
+function runRowToInfo(row: RunRow): RunInfo {
+  return {
+    runId: row.run_id,
+    sessionId: row.session_id,
+    clogId: row.clog_id,
+    status: row.status,
+    attempt: row.attempt,
+    maxAttempts: row.max_attempts,
+    wakeAt: row.wake_at,
+    lastError: row.last_error,
+    createdTs: row.created_ts,
+    updatedTs: row.updated_ts,
+  };
+}
+
+function backoffMs(attempt: number): number {
+  // exponential backoff: 1s, 2s, 4s, 8s, ... capped at 60s
+  return Math.min(1000 * Math.pow(2, attempt), 60_000);
+}
+
+async function applyOutcome(db: SqlClient, run: RunRow, outcome: TickOutcome): Promise<void> {
+  switch (outcome.status) {
+    case "ok": {
+      // If new input arrived during processing, go back to pending
+      const freshRow = await getRun(db, run.run_id);
+      const hasPendingInput = freshRow?.pending_input != null;
+      await releaseRun(db, run.run_id, {
+        status: hasPendingInput ? "pending" : "idle",
+        attempt: 0,
+        last_error: null,
+        wake_at: null,
+      });
+      break;
+    }
+    case "done": {
+      await releaseRun(db, run.run_id, {
+        status: "done",
+        last_error: null,
+        wake_at: null,
+      });
+      break;
+    }
+    case "continue": {
+      await releaseRun(db, run.run_id, {
+        status: "pending",
+        pending_input: outcome.input ?? null,
+        attempt: 0,
+        last_error: null,
+        wake_at: null,
+      });
+      break;
+    }
+    case "wait": {
+      await releaseRun(db, run.run_id, {
+        status: "waiting",
+        wake_at: outcome.wakeAt,
+        last_error: null,
+      });
+      break;
+    }
+    case "retry": {
+      const nextAttempt = run.attempt + 1;
+      if (nextAttempt >= run.max_attempts) {
+        await releaseRun(db, run.run_id, {
+          status: "failed",
+          attempt: nextAttempt,
+          last_error: outcome.error,
+          wake_at: null,
+        });
+      } else {
+        await releaseRun(db, run.run_id, {
+          status: "pending",
+          attempt: nextAttempt,
+          wake_at: nowMs() + backoffMs(nextAttempt),
+          last_error: outcome.error,
+        });
+      }
+      break;
+    }
+    case "failed": {
+      await releaseRun(db, run.run_id, {
+        status: "failed",
+        last_error: outcome.error,
+        wake_at: null,
+      });
+      break;
+    }
+  }
+}
+
 export function createOcean(opts: OceanOptions): Ocean {
   const registry = new ClogRegistry();
   let lastGcTs = 0;
-
-  async function toolInvokerFactoryForTick(args: {
-    runId: string;
-    tickId: string;
-    sessionId: string;
-  }) {
-    // returns a factory that creates a fresh per-clog tool invoker (fresh 1R/1W budget)
-    return (clogId: string) => {
-      const readCalled = { value: false };
-      const writeCalled = { value: false };
-      const ledger = {
-        global: false,
-        session: new Set<string>(),
-        run: new Set<string>(),
-        tickRows: new Set<string>(),
-      };
-
-      // placeholder; filled below via closure
-      let factory: (id: string) => any;
-
-      const invoker = createToolInvoker({
-        db: opts.db,
-        registry,
-        tickCtx: { clogId, sessionId: args.sessionId, runId: args.runId, tickId: args.tickId },
-        readCalled,
-        writeCalled,
-        ledger,
-        toolInvokerFactory: (id: string) => factory(id),
-      });
-
-      factory = (id: string) => toolInvokerFactoryForTickSync(args)(id);
-
-      // The above self-reference is tricky; use the sync helper below.
-      return invoker;
-    };
-  }
+  const defaultInstanceId = opts.instanceId ?? randomId("inst");
 
   function toolInvokerFactoryForTickSync(args: { runId: string; tickId: string; sessionId: string }) {
     return (clogId: string) => {
@@ -110,9 +197,16 @@ export function createOcean(opts: OceanOptions): Ocean {
       registry.register(clog);
     },
 
-    async createRun({ sessionId, initialState }) {
+    async createRun({ sessionId, clogId, input, initialState, retry }) {
       const runId = randomId("run");
-      await createRun(opts.db, runId, sessionId, initialState ?? { created: nowMs() });
+      await createRun(opts.db, {
+        runId,
+        sessionId,
+        clogId,
+        initialState,
+        input,
+        maxAttempts: retry?.maxAttempts,
+      });
       return { runId };
     },
 
@@ -141,6 +235,60 @@ export function createOcean(opts: OceanOptions): Ocean {
         throw err;
       }
       return (result.output as any)?.result;
+    },
+
+    async signal(runId, input) {
+      await signalRun(opts.db, runId, input);
+    },
+
+    async advance() {
+      const instanceId = defaultInstanceId;
+      const lockMs = opts.lockMs ?? 30_000;
+      const results: Array<{ runId: string; outcome: string }> = [];
+
+      const run = await acquireRun(opts.db, instanceId, lockMs);
+      if (!run) return { advanced: 0, results: [] };
+
+      const handler = registry.getAdvanceHandler(run.clog_id);
+      if (!handler) {
+        await releaseRun(opts.db, run.run_id, {
+          status: "failed",
+          last_error: "no onAdvance handler",
+        });
+        return { advanced: 1, results: [{ runId: run.run_id, outcome: "failed" }] };
+      }
+
+      // Create tick
+      const tickId = randomId("tick");
+      await beginTickEntity(opts.db, run.run_id, tickId);
+
+      // Build tool invoker
+      const factory = toolInvokerFactoryForTickSync({
+        runId: run.run_id,
+        tickId,
+        sessionId: run.session_id,
+      });
+      const tools = factory(run.clog_id);
+
+      // Call onAdvance
+      let outcome: TickOutcome;
+      try {
+        outcome = await handler(run.pending_input, { tools, attempt: run.attempt });
+      } catch (e: any) {
+        outcome = { status: "retry", error: e?.message ?? String(e) };
+      }
+
+      // Apply outcome to run state
+      await applyOutcome(opts.db, run, outcome);
+      results.push({ runId: run.run_id, outcome: outcome.status });
+
+      return { advanced: 1, results };
+    },
+
+    async getRun(runId) {
+      const row = await getRun(opts.db, runId);
+      if (!row) return null;
+      return runRowToInfo(row);
     },
 
     async readEvents({ scope, afterSeq, limit }) {
