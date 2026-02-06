@@ -112,9 +112,13 @@ async function applyOutcome(db: SqlClient, run: RunRow, outcome: TickOutcome): P
       break;
     }
     case "continue": {
+      // Check if a new signal arrived during processing.
+      // If so, the signal's input takes precedence over continue's input.
+      const freshCont = await getRun(db, run.run_id);
+      const hasNewContSignal = freshCont?.pending_input != null;
       await releaseRun(db, run.run_id, {
         status: "pending",
-        pending_input: outcome.input ?? null,
+        pending_input: hasNewContSignal ? undefined : (outcome.input ?? null),
         attempt: 0,
         last_error: null,
         wake_at: null,
@@ -122,13 +126,27 @@ async function applyOutcome(db: SqlClient, run: RunRow, outcome: TickOutcome): P
       break;
     }
     case "wait": {
-      await releaseRun(db, run.run_id, {
-        status: "waiting",
-        attempt: 0,
-        wake_at: outcome.wakeAt,
-        last_error: null,
-        pending_input: null,
-      });
+      // Check if a new signal arrived during processing.
+      const freshWait = await getRun(db, run.run_id);
+      const hasNewWaitInput = freshWait?.pending_input != null;
+      if (hasNewWaitInput) {
+        // New signal takes precedence — go to pending instead of waiting.
+        await releaseRun(db, run.run_id, {
+          status: "pending",
+          attempt: 0,
+          wake_at: null,
+          last_error: null,
+          pending_input: undefined, // keep signal's value in DB
+        });
+      } else {
+        await releaseRun(db, run.run_id, {
+          status: "waiting",
+          attempt: 0,
+          wake_at: outcome.wakeAt,
+          last_error: null,
+          pending_input: null,
+        });
+      }
       break;
     }
     case "retry": {

@@ -413,6 +413,89 @@ describe("signal semantics", () => {
     expect((processed[1].payload as any).input).toBe("second-input");
   });
 
+  it("signal during wait processing → skips wait, processes signal immediately", async () => {
+    // Handler returns "wait" but a signal arrives during processing.
+    // The signal should take precedence — run goes to "pending" instead of "waiting".
+    const ctx: { ocean?: any; targetRunId?: string; signaled: boolean } = { signaled: false };
+    const waitSignalClog = callbackClog("wait-signal", async (input, { tools }) => {
+      if (!ctx.signaled && ctx.ocean && ctx.targetRunId && input === "will-wait") {
+        ctx.signaled = true;
+        await ctx.ocean.signal(ctx.targetRunId, "interrupt");
+      }
+      await tools({
+        name: "ocean.events.emit",
+        input: { scope: { kind: "global" }, type: "processed", payload: { input } },
+      });
+      if (input === "will-wait") return { status: "wait", wakeAt: Date.now() + 60_000 };
+      return { status: "ok" };
+    });
+
+    env = await createTestEnv({ clogs: [waitSignalClog] });
+    ctx.ocean = env.ocean;
+
+    const { runId } = await env.ocean.createRun({
+      sessionId: "s1",
+      clogId: "wait-signal",
+      input: "will-wait",
+    });
+    ctx.targetRunId = runId;
+
+    // First tick: handler returns wait, but signal "interrupt" arrived during processing.
+    // Should NOT go to waiting — should go to pending and process the signal.
+    const total = await env.cron.drain();
+    expect(total).toBe(2); // "will-wait" (wait outcome overridden) + "interrupt" (ok)
+
+    const run = await env.ocean.getRun(runId);
+    expect(run?.status).toBe("idle");
+
+    const events = await env.ocean.readEvents({ scope: { kind: "global" } });
+    const processed = events.filter((e) => e.type === "processed");
+    expect(processed.length).toBe(2);
+    expect((processed[0].payload as any).input).toBe("will-wait");
+    expect((processed[1].payload as any).input).toBe("interrupt");
+  });
+
+  it("signal during continue processing → signal takes precedence over continue input", async () => {
+    // Handler returns "continue" with input "next-step", but a signal with "external-data"
+    // arrives during processing. The signal's input should take precedence.
+    const ctx: { ocean?: any; targetRunId?: string; signaled: boolean } = { signaled: false };
+    const contSignalClog = callbackClog("cont-signal", async (input, { tools }) => {
+      if (!ctx.signaled && ctx.ocean && ctx.targetRunId && input === "start") {
+        ctx.signaled = true;
+        await ctx.ocean.signal(ctx.targetRunId, "external-data");
+      }
+      await tools({
+        name: "ocean.events.emit",
+        input: { scope: { kind: "global" }, type: "processed", payload: { input } },
+      });
+      if (input === "start") return { status: "continue", input: "next-step" };
+      return { status: "ok" };
+    });
+
+    env = await createTestEnv({ clogs: [contSignalClog] });
+    ctx.ocean = env.ocean;
+
+    const { runId } = await env.ocean.createRun({
+      sessionId: "s1",
+      clogId: "cont-signal",
+      input: "start",
+    });
+    ctx.targetRunId = runId;
+
+    const total = await env.cron.drain();
+    expect(total).toBe(2); // "start" (continue overridden) + "external-data" (ok)
+
+    const run = await env.ocean.getRun(runId);
+    expect(run?.status).toBe("idle");
+
+    const events = await env.ocean.readEvents({ scope: { kind: "global" } });
+    const processed = events.filter((e) => e.type === "processed");
+    expect(processed.length).toBe(2);
+    expect((processed[0].payload as any).input).toBe("start");
+    // Signal's input should have been used, not continue's "next-step"
+    expect((processed[1].payload as any).input).toBe("external-data");
+  });
+
   it("signal with identical payload during processing → detected as new input", async () => {
     // After consumePendingInput, DB pending_input is null.
     // A signal with any payload (even identical) sets it to non-null.
