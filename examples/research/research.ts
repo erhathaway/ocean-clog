@@ -171,6 +171,8 @@ if (!session) {
   saveSession(session);
 }
 
+let synthesizing = false;
+
 // --- advance helper ---
 
 async function advanceAll(): Promise<void> {
@@ -258,6 +260,7 @@ while (!session.done) {
         if (task) {
           log("followup", `${payload.taskId}: ${payload.direction}`);
           task.done = false;
+          synthesizing = false; // reset so next round can synthesize
           await ocean.signal(task.runId, {
             taskId: task.id,
             question: task.question,
@@ -280,29 +283,8 @@ while (!session.done) {
 
   saveSession(session);
 
-  // If all tasks are done and we haven't finished, synthesize
-  if (!session.done && session.tasks.length > 0 && session.tasks.every((t) => t.done)) {
-    await advanceAll();
-    const lateEvents = await ocean.readEvents({
-      scope: { kind: "global" },
-      afterSeq: session.lastSeq,
-    });
-    for (const evt of lateEvents) {
-      session.lastSeq = evt.seq;
-      const payload = evt.payload as any;
-      if (evt.type === "research.finding") {
-        const task = session.tasks.find((t) => t.id === payload.taskId);
-        if (task) {
-          task.finding = payload.finding;
-          task.done = true;
-          log(
-            "finding",
-            `${payload.taskId}: ${payload.finding.slice(0, 120)}...`,
-          );
-        }
-      }
-    }
-
+  // If all tasks are done and we haven't sent a synthesize signal yet, do it
+  if (!session.done && !synthesizing && session.tasks.length > 0 && session.tasks.every((t) => t.done)) {
     session.round++;
     const forceComplete = session.round >= MAX_ROUNDS;
     if (forceComplete) {
@@ -324,7 +306,18 @@ while (!session.done) {
       forceComplete,
     });
 
+    synthesizing = true;
     saveSession(session);
+  }
+
+  // Check if coordinator has terminally failed
+  if (synthesizing && !session.done) {
+    const coordRun = await ocean.getRun(session.coordinatorRunId);
+    if (coordRun?.status === "failed") {
+      log("error", `Coordinator failed: ${coordRun.lastError}`);
+      session.done = true;
+      saveSession(session);
+    }
   }
 }
 
