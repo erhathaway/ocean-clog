@@ -57,7 +57,7 @@ export type Ocean = {
   callClog: (args: { runId: string; tickId: string; clogId: string; method: string; payload?: unknown }) => Promise<unknown>;
 
   signal: (runId: string, input?: unknown) => Promise<void>;
-  advance: (opts?: { budgetMs?: number }) => Promise<AdvanceResult>;
+  advance: () => Promise<AdvanceResult>;
   getRun: (runId: string) => Promise<RunInfo | null>;
 
   readEvents: (args: { scope: ReadEventsScope; afterSeq?: number; limit?: number }) => Promise<EventRow[]>;
@@ -102,6 +102,7 @@ async function applyOutcome(db: SqlClient, run: RunRow, outcome: TickOutcome): P
     case "done": {
       await releaseRun(db, run.run_id, {
         status: "done",
+        attempt: 0,
         last_error: null,
         wake_at: null,
       });
@@ -120,6 +121,7 @@ async function applyOutcome(db: SqlClient, run: RunRow, outcome: TickOutcome): P
     case "wait": {
       await releaseRun(db, run.run_id, {
         status: "waiting",
+        attempt: 0,
         wake_at: outcome.wakeAt,
         last_error: null,
       });
@@ -161,7 +163,10 @@ export function createOcean(opts: OceanOptions): Ocean {
   const defaultInstanceId = opts.instanceId ?? randomId("inst");
 
   function toolInvokerFactoryForTickSync(args: { runId: string; tickId: string; sessionId: string }) {
-    return (clogId: string) => {
+    // Returns a factory that creates a fresh per-clog tool invoker (fresh 1R/1W budget).
+    // When a clog calls ocean.clog.call, the callee gets its own invoker via this factory,
+    // so nested clog calls each get independent read/write budgets.
+    const factory = (clogId: string) => {
       const readCalled = { value: false };
       const writeCalled = { value: false };
       const ledger = {
@@ -170,8 +175,6 @@ export function createOcean(opts: OceanOptions): Ocean {
         run: new Set<string>(),
         tickRows: new Set<string>(),
       };
-
-      const factory = toolInvokerFactoryForTickSync(args);
 
       return createToolInvoker({
         db: opts.db,
@@ -183,6 +186,7 @@ export function createOcean(opts: OceanOptions): Ocean {
         toolInvokerFactory: factory,
       });
     };
+    return factory;
   }
 
   return {
