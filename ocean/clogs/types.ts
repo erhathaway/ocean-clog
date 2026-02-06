@@ -10,9 +10,16 @@ export type TickOutcome =
   | { status: "retry"; error: string }
   | { status: "failed"; error: string };
 
+export type AdvanceContext = {
+  tools: ToolInvoker;
+  attempt: number;
+  runId: string;
+  tickId: string;
+};
+
 export type AdvanceHandler = (
   input: unknown,
-  ctx: { tools: ToolInvoker; attempt: number },
+  ctx: AdvanceContext,
 ) => Promise<TickOutcome>;
 
 export type Clog = {

@@ -1,0 +1,11 @@
+{
+  "name": "ocean-research-example",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@ai-sdk/openai": "^3.0.25",
+    "@libsql/client": "^0.17.0",
+    "ai": "^6.0.73",
+    "drizzle-orm": "^0.45.1"
+  }
+}

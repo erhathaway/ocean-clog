@@ -285,7 +285,7 @@ export function createOcean(opts: OceanOptions): Ocean {
       // Call onAdvance
       let outcome: TickOutcome;
       try {
-        outcome = await handler(run.pending_input, { tools, attempt: run.attempt });
+        outcome = await handler(run.pending_input, { tools, attempt: run.attempt, runId: run.run_id, tickId });
       } catch (e: any) {
         outcome = { status: "retry", error: e?.message ?? String(e) };
       }
