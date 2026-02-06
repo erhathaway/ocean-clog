@@ -88,15 +88,19 @@ function backoffMs(attempt: number): number {
 async function applyOutcome(db: SqlClient, run: RunRow, outcome: TickOutcome): Promise<void> {
   switch (outcome.status) {
     case "ok": {
-      // If new input arrived during processing, go back to pending
+      // Check if a *new* signal arrived during processing.
+      // Compare the fresh DB value against what the handler received.
       const freshRow = await getRun(db, run.run_id);
-      const hasPendingInput = freshRow?.pending_input != null;
+      const freshInput = freshRow?.pending_input ?? null;
+      const consumedInput = run.pending_input ?? null;
+      const hasNewInput = freshInput != null
+        && JSON.stringify(freshInput) !== JSON.stringify(consumedInput);
       await releaseRun(db, run.run_id, {
-        status: hasPendingInput ? "pending" : "idle",
+        status: hasNewInput ? "pending" : "idle",
         attempt: 0,
         last_error: null,
         wake_at: null,
-        pending_input: hasPendingInput ? undefined : null,
+        pending_input: hasNewInput ? undefined : null,
       });
       break;
     }
@@ -142,7 +146,7 @@ async function applyOutcome(db: SqlClient, run: RunRow, outcome: TickOutcome): P
         });
       } else {
         await releaseRun(db, run.run_id, {
-          status: "pending",
+          status: "waiting",
           attempt: nextAttempt,
           wake_at: nowMs() + backoffMs(nextAttempt),
           last_error: outcome.error,

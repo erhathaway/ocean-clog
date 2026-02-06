@@ -5,7 +5,7 @@ import type { Clog, TickOutcome } from "../clogs/types.js";
 // ---------------------------------------------------------------------------
 // counterClog — test fixture
 //
-// Reads/increments a counter in run storage. Supports commands via input:
+// Tracks a counter via closure (no storage ops needed). Supports commands:
 //   "increment" → ok (default)
 //   "continue"  → continue with next input
 //   "wait"      → wait 60s
@@ -14,32 +14,15 @@ import type { Clog, TickOutcome } from "../clogs/types.js";
 // ---------------------------------------------------------------------------
 
 function counterClog(): Clog {
+  let counter = 0;
+
   return {
     id: "counter",
     endpoints: {},
     async onAdvance(input, { tools, attempt }) {
       const action = (typeof input === "string" ? input : (input as any)?.action) ?? "increment";
 
-      // Read run storage
-      const readResult = await tools({
-        name: "ocean.storage.read_scoped",
-        input: { plans: [{ kind: "run", runId: "__SELF__" }] },
-      });
-
-      // We don't know the runId inside the clog, so we read whatever comes back
-      const snapshot = (readResult as any).output?.snapshot ?? [];
-      const runEntry = snapshot.find((s: any) => s.scope === "run");
-      const counter = (runEntry?.value as any)?.counter ?? 0;
-
-      // Write incremented counter
-      // We need the runId for the write op — extract from the read snapshot
-      const runId = runEntry?.runId;
-      if (runId) {
-        await tools({
-          name: "ocean.storage.write_scoped",
-          input: { ops: [{ op: "run.set", runId, value: { counter: counter + 1 } }] },
-        });
-      }
+      counter++;
 
       // Emit an event so tests can observe
       await tools({
@@ -47,7 +30,7 @@ function counterClog(): Clog {
         input: {
           scope: { kind: "global" },
           type: "counter.tick",
-          payload: { counter: counter + 1, action, attempt },
+          payload: { counter, action, attempt },
         },
       });
 
@@ -193,20 +176,20 @@ describe("test harness", () => {
       retry: { maxAttempts: 3 },
     });
 
-    // Attempt 0 → retry → pending with wake_at = now + 1s backoff
+    // Attempt 0 → retry → waiting with backoff(1) = 2s
     await env.cron.drain();
     let run = await env.ocean.getRun(runId);
-    expect(run?.status).not.toBe("failed"); // still retrying
+    expect(run?.status).toBe("waiting");
     expect(run?.attempt).toBe(1);
 
-    // Advance past first backoff (1s)
-    env.clock.advance(1_500);
+    // Advance past first backoff (2s)
+    env.clock.advance(2_500);
     await env.cron.drain();
     run = await env.ocean.getRun(runId);
     expect(run?.attempt).toBe(2);
 
-    // Advance past second backoff (2s)
-    env.clock.advance(2_500);
+    // Advance past second backoff (4s)
+    env.clock.advance(4_500);
     await env.cron.drain();
     run = await env.ocean.getRun(runId);
     // attempt 2 → nextAttempt = 3 >= maxAttempts(3) → failed
