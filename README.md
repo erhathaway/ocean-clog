@@ -42,9 +42,11 @@ That's the whole execution model.
 
 Ocean provides the execution substrate:
 
-**Runs** — A durable state machine. One per conversation, workflow, or task.
+**Runs** — A durable state machine owned by a clog. One per conversation, workflow, or task. Runs persist across requests and survive process crashes.
 
 **Ticks** — A bounded unit of progress inside a run. One per user message, one per webhook, one per cron hit. Work happens in ticks.
+
+**Signal / Advance** — The primary execution pattern. `signal(runId, input)` queues work. `advance()` picks up one ready run, locks it, calls the owning clog's `onAdvance` handler, and applies the outcome. No background workers — call `advance()` from any request or cron.
 
 **Events** — An append-only audit log. Every streaming delta, every tool call, every state change. Perfect for SSE, polling, debugging, and replays.
 
@@ -71,10 +73,11 @@ No blind writes. No clobbered state. Full auditability.
 
 A clog is Ocean's unit of modularity. Each clog:
 
-- Has an `id` and a set of endpoint handlers
+- Has an `id`, endpoint handlers, and an optional `onAdvance` handler
 - Gets its own storage budget per tick (isolated from other clogs)
 - Interacts with the world strictly through **tools** (storage, events, cross-clog calls)
 - Can call other clogs via `ocean.clog.call`
+- Controls run lifecycle via `TickOutcome` (ok, done, continue, wait, retry, failed)
 
 You compose capabilities by wiring clogs together:
 
@@ -101,22 +104,43 @@ const ocean = createOcean({ db });
 await ocean.migrate();
 ocean.registerClog(chatClog);
 
-// Create a conversation
-const { runId } = await ocean.createRun({ sessionId: "user_123" });
+// Create a run owned by the chat clog
+const { runId } = await ocean.createRun({
+  sessionId: "user_123",
+  clogId: "chat",
+  input: { userText: "Hello!" },  // starts in "pending" status
+});
 
-// Process a message (one tick of work)
+// Process it — calls chatClog.onAdvance with the input
+await ocean.advance();
+
+// Check the run
+const info = await ocean.getRun(runId);
+// => { status: "idle", attempt: 0, ... }
+
+// Send another message
+await ocean.signal(runId, { userText: "Tell me more" });
+await ocean.advance();
+
+// Read back the streaming events
+const events = await ocean.readEvents({
+  scope: { kind: "run", runId },
+  afterSeq: 0,
+});
+```
+
+### Direct invocation (alternative)
+
+For synchronous request/response calls that bypass the state machine:
+
+```ts
+const { runId } = await ocean.createRun({ sessionId: "user_123", clogId: "chat" });
 const { tickId } = await ocean.beginTick({ runId });
 const result = await ocean.callClog({
   runId, tickId,
   clogId: "chat",
   method: "onMessage",
   payload: { runId, tickId, userText: "Hello!" },
-});
-
-// Read back the streaming events
-const events = await ocean.readEvents({
-  scope: { kind: "run", runId },
-  afterSeq: 0,
 });
 ```
 
@@ -151,48 +175,45 @@ createLibsqlDb({
 
 ## Writing a clog
 
-A clog is just an object with an id and endpoint handlers:
+A clog is an object with an `id`, an optional `onAdvance` handler, and endpoint handlers:
 
 ```ts
-import type { Clog } from "./ocean/index.js";
+import type { Clog, TickOutcome } from "./ocean/index.js";
 
 const searchClog: Clog = {
   id: "search",
+
+  // Called by advance() when this clog's run has pending work
+  async onAdvance(input, { tools, attempt }): Promise<TickOutcome> {
+    const { query } = (input ?? {}) as { query?: string };
+    if (!query) return { status: "ok" };
+
+    // Read state, do work, write results
+    const read = await tools({
+      name: "ocean.storage.read_scoped",
+      input: { plans: [{ kind: "run" }] },
+    });
+    if (!read.ok) return { status: "retry", error: read.error.message };
+
+    const results = await fetchSearchResults(query);
+
+    await tools({
+      name: "ocean.events.emit",
+      input: {
+        scope: { kind: "run" },
+        type: "search.results",
+        payload: { count: results.length },
+      },
+    });
+
+    // Return "done" — or "ok" to idle, "continue" for more work, "wait" to sleep
+    return { status: "done", output: { results } };
+  },
+
+  // Direct-invocation endpoints (called via ocean.callClog)
   endpoints: {
     async query(payload, ctx) {
-      // 1. Read — get run state + reserve tick rows
-      const read = await ctx.tools({
-        name: "ocean.storage.read_scoped",
-        input: {
-          plans: [
-            { kind: "run", runId: payload.runId },
-            { kind: "tick_rows", runId: payload.runId, tickId: payload.tickId, rowIds: ["results"] },
-          ],
-        },
-      });
-
-      // 2. Compute — do the actual work, emit events
       const results = await fetchSearchResults(payload.query);
-
-      await ctx.tools({
-        name: "ocean.events.emit",
-        input: {
-          scope: { kind: "run", runId: payload.runId },
-          type: "search.results",
-          payload: { count: results.length },
-        },
-      });
-
-      // 3. Write — persist results into tick storage
-      await ctx.tools({
-        name: "ocean.storage.write_scoped",
-        input: {
-          ops: [
-            { op: "tick.set", runId: payload.runId, tickId: payload.tickId, rowId: "results", value: results },
-          ],
-        },
-      });
-
       return { ok: true, results };
     },
   },
@@ -203,14 +224,14 @@ const searchClog: Clog = {
 
 ```
 ocean/                  — the runtime
-  ocean.ts              — createOcean() entry point
+  ocean.ts              — createOcean() entry point (signal, advance, getRun, etc.)
   index.ts              — public API exports
   db/
-    schema.ts           — Drizzle schema (7 tables)
+    schema.ts           — Drizzle schema (8 tables)
     libsql.ts           — libSQL/Turso adapter
     drizzle/            — generated migrations
   engine/
-    run.ts              — run + session CRUD
+    run.ts              — run CRUD, signal, acquire/release locking
     tick.ts             — tick management
     events.ts           — event emit, read, TTL cleanup
   storage/
@@ -219,12 +240,19 @@ ocean/                  — the runtime
     write_scoped.ts     — batched write + RBW enforcement (transactional)
     history.ts          — bulk tick history for hydration
   clogs/
-    types.ts            — Clog + ClogHandler types
+    types.ts            — Clog, TickOutcome, AdvanceHandler types
     registry.ts         — clog registration
     runtime.ts          — tool invoker dispatch
   tools/                — ocean.storage.*, ocean.events.*, ocean.clog.*
+  core/
+    ids.ts              — random ID generation
+    time.ts             — time utilities
+    errors.ts           — error types
   examples/
-    chat_clog.ts        — complete chat clog example
+    chat_clog.ts               — basic chat clog (endpoints + onAdvance)
+    long_running_chat_agent.ts — persistent chat via signal/advance
+    hn_digest_clog.ts          — periodic HN scrape → WhatsApp (multi-tick)
+    task_manager_agent.ts      — agent that manages scheduled tasks
 
 app/                    — SvelteKit frontend (scaffolded)
 ```

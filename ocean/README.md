@@ -73,15 +73,15 @@ Ocean is fully opportunistic. It only does work when something pokes it — an H
 Every run has a status that drives what happens next:
 
 ```
-idle ──signal──→ pending ──lock──→ active ──outcome──→ idle      (done for now, waiting for next signal)
-                                                    → done      (terminal success)
-                                                    → pending   (more work, re-advance next poke)
-                                                    → waiting   (sleep until wake_at, then re-advance)
-                                                    → pending   (retry after backoff)
-                                                    → failed    (retries exhausted, terminal)
+idle ──signal──→ pending ──advance──→ [locked] ──outcome──→ idle      (done for now, waiting for next signal)
+                                                          → done      (terminal success)
+                                                          → pending   (more work, re-advance next poke)
+                                                          → waiting   (sleep until wake_at, then re-advance)
+                                                          → pending   (retry after backoff)
+                                                          → failed    (retries exhausted, terminal)
 ```
 
-Six statuses: `idle`, `pending`, `active`, `waiting`, `done`, `failed`.
+Five statuses: `idle`, `pending`, `waiting`, `done`, `failed`. A run being processed is `pending` with a non-null `locked_by` — there is no separate "active" status. The lock fields (`locked_by`, `lock_expires_at`) guard concurrent access.
 
 ### How work flows
 
@@ -123,13 +123,17 @@ Run-level lock with TTL. Two fields on `runs`:
 
 Acquire atomically:
 ```sql
-UPDATE runs SET locked_by = ?, lock_expires_at = ?, status = 'active'
-WHERE run_id = ? AND status IN ('pending', 'waiting')
-  AND (locked_by IS NULL OR lock_expires_at < now)
-  AND (wake_at IS NULL OR wake_at <= now)
+UPDATE runs SET locked_by = ?, lock_expires_at = ?
+WHERE run_id = (
+  SELECT run_id FROM runs
+  WHERE (status = 'pending' OR (status = 'waiting' AND wake_at <= now))
+    AND (locked_by IS NULL OR lock_expires_at <= now)
+  LIMIT 1
+) AND (status = 'pending' OR (status = 'waiting' AND wake_at <= now))
+  AND (locked_by IS NULL OR lock_expires_at <= now)
 ```
 
-If the instance crashes, the lock expires and the next poke picks it up. The run is still `active` with an expired lock — `advance()` treats that as available.
+The outer WHERE duplicates the subquery conditions to make it a single atomic statement (no TOCTOU race). If the instance crashes, the lock expires and the next poke picks it up.
 
 ### Signals
 
@@ -145,7 +149,7 @@ UPDATE runs SET
   status = CASE
     WHEN status = 'idle' THEN 'pending'
     WHEN status = 'waiting' THEN 'pending'
-    ELSE status  -- leave active/pending alone
+    ELSE status  -- leave pending/locked alone
   END
 WHERE run_id = ?
 ```
@@ -179,8 +183,8 @@ Three primitives for the state machine:
 // Drive work into a run
 ocean.signal(runId: string, input?: unknown): Promise<void>
 
-// Process whatever needs work. Call from anywhere.
-ocean.advance(opts?: { budgetMs?: number }): Promise<AdvanceResult>
+// Process one ready run. Call from anywhere — request handler, cron, webhook.
+ocean.advance(): Promise<AdvanceResult>
 
 // Read run status
 ocean.getRun(runId: string): Promise<RunInfo | null>
@@ -202,13 +206,14 @@ ocean.createRun({
   sessionId: string;
   clogId: string;                // which clog owns this run
   input?: unknown;               // initial pending_input (sets status to "pending")
+  initialState?: unknown;        // initial run storage state
   retry?: {
     maxAttempts?: number;        // default 3
-    backoffMs?: number;          // default 1000
-    backoffMaxMs?: number;       // default 60000
   };
 }): Promise<{ runId: string }>
 ```
+
+Backoff is exponential: 1s, 2s, 4s, 8s... capped at 60s. Hardcoded for simplicity.
 
 ### Schema additions
 
