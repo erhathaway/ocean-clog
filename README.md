@@ -1,4 +1,4 @@
-# Ocean Clog
+# Ocean Clog  🌊 👞
 
 ## **Your own personal AI assistant** with **one click deploy** on **serverless compute**.
 
