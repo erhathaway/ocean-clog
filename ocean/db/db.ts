@@ -5,5 +5,5 @@ export type SqlClient = LibSQLDatabase;
 
 export async function enableForeignKeys(db: SqlClient): Promise<void> {
   // SQLite/libSQL: FK enforcement is per-connection.
-  await db.execute(sql`PRAGMA foreign_keys = ON;`);
+  await db.run(sql`PRAGMA foreign_keys = ON;`);
 }
