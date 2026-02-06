@@ -1,6 +1,7 @@
 # Ocean Clog
 
-Your own personal AI assistant with one click deploy on single ephemeral serverless compute.
+## **Your own personal AI assistant** with **one click deploy** on **serverless compute**.
+
 
 Ocean Clog is a persistence-first system for building resumable AI agents. **Ocean** is the runtime — it handles durable state, bounded execution, and streaming. **Clogs** are the adapters — modular pieces that plug into Ocean to do the actual work (chat, search, browsing, planning, memory, billing, whatever you need).
 
