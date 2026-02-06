@@ -3,8 +3,8 @@
   "private": true,
   "type": "module",
   "devDependencies": {
-    "@libsql/client": "^0.15.5",
-    "drizzle-orm": "^0.36.4",
-    "drizzle-kit": "^0.30.4"
+    "@libsql/client": "^0.17.0",
+    "drizzle-orm": "^0.45.1",
+    "drizzle-kit": "^0.31.8"
   }
 }
