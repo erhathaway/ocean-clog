@@ -53,3 +53,5 @@ ocean/db/drizzle/
 # Example session files
 .chat-session
 .research-session
+
+*.db-*
