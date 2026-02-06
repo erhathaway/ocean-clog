@@ -150,6 +150,31 @@ export async function consumePendingInput(db: SqlClient, runId: string): Promise
   await db.update(runs).set({ pending_input: null }).where(eq(runs.run_id, runId));
 }
 
+/**
+ * Atomically acquire a run AND clear its pending_input.
+ * Uses a SAVEPOINT so no signalRun can interleave between acquire
+ * and consume. Savepoints nest safely (unlike BEGIN which fails
+ * inside an existing transaction).
+ */
+export async function acquireAndConsumeRun(
+  db: SqlClient,
+  instanceId: string,
+  lockMs: number,
+): Promise<RunRow | null> {
+  await db.run(sql`SAVEPOINT acquire_consume`);
+  try {
+    const run = await acquireRun(db, instanceId, lockMs);
+    if (run && run.pending_input != null) {
+      await consumePendingInput(db, run.run_id);
+    }
+    await db.run(sql`RELEASE SAVEPOINT acquire_consume`);
+    return run;
+  } catch (e) {
+    await db.run(sql`ROLLBACK TO SAVEPOINT acquire_consume`);
+    throw e;
+  }
+}
+
 export async function releaseRun(
   db: SqlClient,
   runId: string,
@@ -174,6 +199,42 @@ export async function releaseRun(
   if (patch.pending_input !== undefined) sets.pending_input = patch.pending_input;
 
   await db.update(runs).set(sets).where(eq(runs.run_id, runId));
+}
+
+/**
+ * Atomic release that checks for signals in a single UPDATE (no TOCTOU race).
+ *
+ * If `pending_input IS NOT NULL` (signal arrived during processing):
+ *   status="pending", attempt=0, wake_at=null, last_error=null, pending_input kept.
+ * Otherwise: apply the `noSignal` values.
+ *
+ * pending_input_json must be pre-serialized JSON text (or null for SQL NULL)
+ * because we mix raw SQL CASE expressions with Drizzle's json-mode column.
+ */
+export async function releaseRunAtomic(
+  db: SqlClient,
+  runId: string,
+  noSignal: {
+    status: string;
+    attempt: number;
+    wake_at: number | null;
+    last_error: string | null;
+    pending_input_json: string | null;
+  },
+): Promise<void> {
+  const now = nowMs();
+  await db.run(sql`
+    UPDATE runs SET
+      locked_by       = NULL,
+      lock_expires_at = NULL,
+      updated_ts      = ${now},
+      status          = CASE WHEN pending_input IS NOT NULL THEN 'pending'          ELSE ${noSignal.status} END,
+      attempt         = CASE WHEN pending_input IS NOT NULL THEN 0                  ELSE ${noSignal.attempt} END,
+      wake_at         = CASE WHEN pending_input IS NOT NULL THEN NULL               ELSE ${noSignal.wake_at} END,
+      last_error      = CASE WHEN pending_input IS NOT NULL THEN NULL               ELSE ${noSignal.last_error} END,
+      pending_input   = CASE WHEN pending_input IS NOT NULL THEN pending_input      ELSE ${noSignal.pending_input_json} END
+    WHERE run_id = ${runId}
+  `);
 }
 
 export async function deleteRunEntity(db: SqlClient, runId: string): Promise<void> {

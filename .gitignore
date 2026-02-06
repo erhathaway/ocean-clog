@@ -49,3 +49,6 @@ storybook-static
 !.vscode/extensions.json
 
 ocean/db/drizzle/
+
+# Chat example
+.chat-session
