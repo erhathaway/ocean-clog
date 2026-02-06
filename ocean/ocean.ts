@@ -1,12 +1,14 @@
 import type { SqlClient } from "./db/db.js";
 import { enableForeignKeys } from "./db/db.js";
+import { migrate } from "drizzle-orm/libsql/migrator";
 import type { Clog } from "./clogs/types.js";
 import { ClogRegistry } from "./clogs/registry.js";
 import { createRun, getRun } from "./engine/run.js";
 import { beginTickEntity } from "./engine/tick.js";
 import { randomId } from "./core/ids.js";
 import { nowMs } from "./core/time.js";
-import { gcEventsByTtl } from "./engine/events.js";
+import { gcEventsByTtl, readEventsByScope } from "./engine/events.js";
+import type { ReadEventsScope, EventRow } from "./engine/events.js";
 import { createToolInvoker } from "./clogs/runtime.js";
 
 export type OceanOptions = {
@@ -25,6 +27,8 @@ export type Ocean = {
   beginTick: (args: { runId: string; tickId?: string }) => Promise<{ tickId: string }>;
 
   callClog: (args: { runId: string; tickId: string; clogId: string; method: string; payload?: unknown }) => Promise<unknown>;
+
+  readEvents: (args: { scope: ReadEventsScope; afterSeq?: number; limit?: number }) => Promise<EventRow[]>;
 
   gcEventsIfDue: () => Promise<void>;
 };
@@ -97,7 +101,9 @@ export function createOcean(opts: OceanOptions): Ocean {
   return {
     async migrate() {
       await enableForeignKeys(opts.db);
-      // Run Drizzle migrations generated from ocean/db/schema.ts.
+      await migrate(opts.db, {
+        migrationsFolder: new URL("./db/drizzle", import.meta.url).pathname,
+      });
     },
 
     registerClog(clog: Clog) {
@@ -135,6 +141,10 @@ export function createOcean(opts: OceanOptions): Ocean {
         throw err;
       }
       return (result.output as any)?.result;
+    },
+
+    async readEvents({ scope, afterSeq, limit }) {
+      return readEventsByScope(opts.db, scope, afterSeq ?? 0, limit ?? 100);
     },
 
     async gcEventsIfDue() {

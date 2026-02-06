@@ -33,58 +33,27 @@ export async function storageWriteScoped(
   input: WriteScopedInput,
   ledger: ReadLedger,
 ): Promise<WriteScopedOutput> {
-  let applied = 0;
-
-  // NOTE: For correctness, wrap these ops in a transaction at the db adapter layer.
+  // Validate all ops before executing (fail fast on RBW violations).
   for (const op of input.ops) {
-    if (op.op === "global.set") {
+    if (op.op === "global.set" || op.op === "global.clear") {
       require(ledger.global, ERR.RBW_VIOLATION, "must read global row before writing global row");
-      await upsertGlobal(db, ctx.clogId, op.value);
-      applied++;
-      continue;
-    }
-    if (op.op === "global.clear") {
-      require(ledger.global, ERR.RBW_VIOLATION, "must read global row before clearing global row");
-      await deleteGlobalRow(db, ctx.clogId);
-      applied++;
-      continue;
-    }
-
-    if (op.op === "session.set") {
+    } else if (op.op === "session.set" || op.op === "session.clear") {
       require(op.sessionId === ctx.sessionId, ERR.INVALID_SCOPE, "sessionId does not match current tick context");
       require(ledger.session.has(op.sessionId), ERR.RBW_VIOLATION, "must read session row before writing session row", {
         sessionId: op.sessionId,
       });
-      await upsertSession(db, ctx.clogId, op.sessionId, op.value);
-      applied++;
-      continue;
-    }
-    if (op.op === "session.clear") {
+    } else if (op.op === "session.delete") {
       require(op.sessionId === ctx.sessionId, ERR.INVALID_SCOPE, "sessionId does not match current tick context");
-      require(ledger.session.has(op.sessionId), ERR.RBW_VIOLATION, "must read session row before clearing session row", {
+      require(ledger.session.has(op.sessionId), ERR.RBW_VIOLATION, "must read session row before deleting session entity", {
         sessionId: op.sessionId,
       });
-      await deleteSessionStorageRow(db, ctx.clogId, op.sessionId);
-      applied++;
-      continue;
-    }
-
-    if (op.op === "run.set") {
+    } else if (op.op === "run.set" || op.op === "run.clear") {
       require(op.runId === ctx.runId, ERR.INVALID_SCOPE, "runId does not match current tick context");
       require(ledger.run.has(op.runId), ERR.RBW_VIOLATION, "must read run row before writing run row", { runId: op.runId });
-      await upsertRun(db, ctx.clogId, op.runId, op.value);
-      applied++;
-      continue;
-    }
-    if (op.op === "run.clear") {
+    } else if (op.op === "run.delete") {
       require(op.runId === ctx.runId, ERR.INVALID_SCOPE, "runId does not match current tick context");
-      require(ledger.run.has(op.runId), ERR.RBW_VIOLATION, "must read run row before clearing run row", { runId: op.runId });
-      await deleteRunStorageRow(db, ctx.clogId, op.runId);
-      applied++;
-      continue;
-    }
-
-    if (op.op === "tick.set") {
+      require(ledger.run.has(op.runId), ERR.RBW_VIOLATION, "must read run row before deleting run entity", { runId: op.runId });
+    } else if (op.op === "tick.set" || op.op === "tick.del") {
       require(op.runId === ctx.runId && op.tickId === ctx.tickId, ERR.INVALID_SCOPE, "tick scope does not match current tick context");
       const k = `${op.runId}|${op.tickId}|${op.rowId}`;
       require(ledger.tickRows.has(k), ERR.RBW_VIOLATION, "must read tick row before writing tick row", {
@@ -92,56 +61,47 @@ export async function storageWriteScoped(
         tickId: op.tickId,
         rowId: op.rowId,
       });
-      await upsertTickRow(db, ctx.clogId, op.runId, op.tickId, op.rowId, op.value);
-      applied++;
-      continue;
-    }
-
-    if (op.op === "tick.del") {
+    } else if (op.op === "tick.delete") {
       require(op.runId === ctx.runId && op.tickId === ctx.tickId, ERR.INVALID_SCOPE, "tick scope does not match current tick context");
-      const k = `${op.runId}|${op.tickId}|${op.rowId}`;
-      require(ledger.tickRows.has(k), ERR.RBW_VIOLATION, "must read tick row before deleting tick row", {
-        runId: op.runId,
-        tickId: op.tickId,
-        rowId: op.rowId,
-      });
-      await deleteTickRow(db, ctx.clogId, op.runId, op.tickId, op.rowId);
-      applied++;
-      continue;
-    }
-
-    // Entity deletes (cascading). Still require reading the corresponding singleton first.
-    if (op.op === "session.delete") {
-      require(op.sessionId === ctx.sessionId, ERR.INVALID_SCOPE, "sessionId does not match current tick context");
-      require(ledger.session.has(op.sessionId), ERR.RBW_VIOLATION, "must read session row before deleting session entity", {
-        sessionId: op.sessionId,
-      });
-      await deleteSessionEntity(db, op.sessionId);
-      applied++;
-      continue;
-    }
-
-    if (op.op === "run.delete") {
-      require(op.runId === ctx.runId, ERR.INVALID_SCOPE, "runId does not match current tick context");
-      require(ledger.run.has(op.runId), ERR.RBW_VIOLATION, "must read run row before deleting run entity", { runId: op.runId });
-      await deleteRunEntity(db, op.runId);
-      applied++;
-      continue;
-    }
-
-    if (op.op === "tick.delete") {
-      require(op.runId === ctx.runId && op.tickId === ctx.tickId, ERR.INVALID_SCOPE, "tick scope does not match current tick context");
-      // tick entity delete requires that the caller read at least one tick row id they are “touching”.
-      // If you want stricter semantics, require a specific reserved rowId (e.g. "_tick") be read.
-      // For simplicity: require that any tick row was read in this tick.
       require(ledger.tickRows.size > 0, ERR.RBW_VIOLATION, "must read at least one tick row before deleting tick entity");
-      await deleteTickEntity(db, op.runId, op.tickId);
-      applied++;
-      continue;
+    } else {
+      throw new OceanError(ERR.INVALID_SCOPE, "unknown write op", op);
     }
-
-    throw new OceanError(ERR.INVALID_SCOPE, "unknown write op", op);
   }
+
+  let applied = 0;
+
+  await db.transaction(async (tx) => {
+    // tx (LibSQLTransaction) extends BaseSQLiteDatabase like LibSQLDatabase;
+    // cast to SqlClient so storage helpers accept it.
+    const d = tx as unknown as SqlClient;
+    for (const op of input.ops) {
+      if (op.op === "global.set") {
+        await upsertGlobal(d, ctx.clogId, op.value);
+      } else if (op.op === "global.clear") {
+        await deleteGlobalRow(d, ctx.clogId);
+      } else if (op.op === "session.set") {
+        await upsertSession(d, ctx.clogId, op.sessionId, op.value);
+      } else if (op.op === "session.clear") {
+        await deleteSessionStorageRow(d, ctx.clogId, op.sessionId);
+      } else if (op.op === "run.set") {
+        await upsertRun(d, ctx.clogId, op.runId, op.value);
+      } else if (op.op === "run.clear") {
+        await deleteRunStorageRow(d, ctx.clogId, op.runId);
+      } else if (op.op === "tick.set") {
+        await upsertTickRow(d, ctx.clogId, op.runId, op.tickId, op.rowId, op.value);
+      } else if (op.op === "tick.del") {
+        await deleteTickRow(d, ctx.clogId, op.runId, op.tickId, op.rowId);
+      } else if (op.op === "session.delete") {
+        await deleteSessionEntity(d, op.sessionId);
+      } else if (op.op === "run.delete") {
+        await deleteRunEntity(d, op.runId);
+      } else if (op.op === "tick.delete") {
+        await deleteTickEntity(d, op.runId, op.tickId);
+      }
+      applied++;
+    }
+  });
 
   return { ok: true, applied };
 }
