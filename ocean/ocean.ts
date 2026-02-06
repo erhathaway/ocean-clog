@@ -1,6 +1,7 @@
 import type { SqlClient } from "./db/db.js";
 import { enableForeignKeys } from "./db/db.js";
 import { migrate } from "drizzle-orm/libsql/migrator";
+import { sql } from "drizzle-orm";
 import type { Clog, TickOutcome } from "./clogs/types.js";
 import { ClogRegistry } from "./clogs/registry.js";
 import { createRun, getRun, signalRun, acquireAndConsumeRun, releaseRun, releaseRunAtomic } from "./engine/run.js";
@@ -197,6 +198,8 @@ export function createOcean(opts: OceanOptions): Ocean {
   return {
     async migrate() {
       await enableForeignKeys(opts.db);
+      await opts.db.run(sql`PRAGMA journal_mode = WAL;`);
+      await opts.db.run(sql`PRAGMA busy_timeout = 5000;`);
       await migrate(opts.db, {
         migrationsFolder: new URL("./db/drizzle", import.meta.url).pathname,
       });

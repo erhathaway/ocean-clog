@@ -70,6 +70,11 @@ Respond with ONLY a JSON array of objects with "id" and "question" fields. Examp
     model: openai("gpt-5-nano"),
     system: systemPrompt,
     prompt: data.text,
+        providerOptions: {
+        openai: {
+          reasoningEffort: "minimal"
+        }
+      },
   });
 
   let tasks: Array<{ id: string; question: string }>;

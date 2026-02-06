@@ -46,6 +46,13 @@ export const researcherClog: Clog = {
       model: openai("gpt-5-nano"),
       system: systemPrompt,
       prompt,
+      providerOptions: {
+        openai: {
+          reasoningEffort: "minimal"
+        }
+      },
+    
+      
     });
 
     // Store LLM exchange in tick storage

@@ -1,7 +1,7 @@
 import { createOcean, createLibsqlDb } from "../../ocean/index.js";
 import { coordinatorClog } from "./coordinator.js";
 import { researcherClog } from "./researcher.js";
-import { readFileSync, existsSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, unlinkSync } from "fs";
 
 // Load .env if OPENAI_API_KEY not already set
 if (!process.env.OPENAI_API_KEY) {
@@ -21,12 +21,10 @@ if (!process.env.OPENAI_API_KEY) {
   process.exit(1);
 }
 
-const query = process.argv.slice(2).join(" ");
-if (!query) {
-  console.error("Usage: bun research.ts <query>");
-  process.exit(1);
-}
+// --- types ---
 
+const SESSION_FILE = ".research-session";
+const DB_FILE = "research.db";
 const MAX_ROUNDS = 3;
 
 type Task = {
@@ -37,54 +35,172 @@ type Task = {
   done: boolean;
 };
 
-// --- setup ---
+type Session = {
+  coordinatorRunId: string;
+  query: string;
+  tasks: Task[];
+  lastSeq: number;
+  round: number;
+  done: boolean;
+};
 
-const { db } = createLibsqlDb({ url: "file:./research.db" });
-const ocean = createOcean({ db });
-ocean.registerClog(coordinatorClog);
-ocean.registerClog(researcherClog);
-await ocean.migrate();
+function loadSession(): Session | null {
+  if (!existsSync(SESSION_FILE)) return null;
+  return JSON.parse(readFileSync(SESSION_FILE, "utf-8"));
+}
 
-// --- helpers ---
+function saveSession(session: Session): void {
+  writeFileSync(SESSION_FILE, JSON.stringify(session, null, 2));
+}
 
-async function advanceAll(): Promise<void> {
-  while (true) {
-    const { advanced } = await ocean.advance();
-    if (advanced === 0) break;
+function resetState(): void {
+  for (const f of [SESSION_FILE, DB_FILE, `${DB_FILE}-wal`, `${DB_FILE}-shm`]) {
+    if (existsSync(f)) unlinkSync(f);
   }
 }
+
+// --- helpers ---
 
 function log(prefix: string, message: string): void {
   console.log(`\x1b[36m[${prefix}]\x1b[0m ${message}`);
 }
 
+function createOceanInstance() {
+  const { db } = createLibsqlDb({ url: `file:./${DB_FILE}` });
+  return createOcean({ db });
+}
+
+// --- determine if we need a fresh start (before opening DB) ---
+
+const query = process.argv.slice(2).join(" ");
+let session = loadSession();
+
+if (query) {
+  // Decide whether to start fresh before we open the DB
+  if (session) {
+    if (session.done) {
+      log("info", `Previous research on "${session.query}" is complete. Starting fresh.`);
+      resetState();
+      session = null;
+    } else if (session.query !== query) {
+      log("info", `Different query. Previous: "${session.query}". Starting fresh.`);
+      resetState();
+      session = null;
+    }
+  }
+}
+
+// --- now open DB (after any reset) ---
+
+const ocean = createOceanInstance();
+ocean.registerClog(coordinatorClog);
+ocean.registerClog(researcherClog);
+await ocean.migrate();
+
+// --- status check (no query arg) ---
+
+if (!query) {
+  if (!session) {
+    console.error("Usage: bun research.ts <query>");
+    console.error("       bun research.ts          (check status of current research)");
+    process.exit(1);
+  }
+
+  const run = await ocean.getRun(session.coordinatorRunId);
+  if (!run) {
+    log("status", "Previous research session not found in database. Run a new query to start fresh.");
+    process.exit(1);
+  }
+
+  log("query", session.query);
+  log("status", `Coordinator: ${run.status}`);
+  log("status", `Round: ${session.round}/${MAX_ROUNDS}`);
+  log("status", `Tasks: ${session.tasks.length} (${session.tasks.filter((t) => t.done).length} completed)`);
+
+  if (session.done) {
+    const events = await ocean.readEvents({
+      scope: { kind: "global" },
+      afterSeq: 0,
+    });
+    const complete = events.find((e) => e.type === "research.complete");
+    if (complete) {
+      console.log();
+      log("complete", "Research complete!\n");
+      console.log((complete.payload as any).summary);
+    }
+  } else {
+    for (const task of session.tasks) {
+      const status = task.done ? "\x1b[32mdone\x1b[0m" : "\x1b[33mpending\x1b[0m";
+      log("task", `  ${task.id} [${status}]: ${task.question}`);
+    }
+  }
+
+  process.exit(0);
+}
+
+// --- validate resume or start fresh ---
+
+if (session) {
+  const run = await ocean.getRun(session.coordinatorRunId);
+  if (!run || run.status === "failed") {
+    log("info", "Previous research failed or not found. Starting fresh.");
+    session = null;
+    // DB is already open and clean (tables exist), just need a new session
+  } else {
+    log("info", `Resuming research on "${query}" (round ${session.round})`);
+  }
+}
+
+if (!session) {
+  const { runId: coordinatorRunId } = await ocean.createRun({
+    sessionId: "research",
+    clogId: "coordinator",
+  });
+
+  session = {
+    coordinatorRunId,
+    query,
+    tasks: [],
+    lastSeq: 0,
+    round: 0,
+    done: false,
+  };
+
+  log("start", `Research query: "${query}"`);
+  await ocean.signal(session.coordinatorRunId, { type: "query", text: query });
+  saveSession(session);
+}
+
+// --- advance helper ---
+
+async function advanceAll(): Promise<void> {
+  while (true) {
+    const { advanced, results } = await ocean.advance();
+    if (advanced === 0) break;
+    for (const r of results) {
+      if (r.outcome === "retry" || r.outcome === "failed") {
+        const run = await ocean.getRun(r.runId);
+        log("advance", `${r.runId.slice(0, 12)}… → ${r.outcome}: ${run?.lastError}`);
+      } else {
+        log("advance", `${r.runId.slice(0, 12)}… → ${r.outcome}`);
+      }
+    }
+  }
+}
+
 // --- main loop ---
 
-const { runId: coordinatorRunId } = await ocean.createRun({
-  sessionId: "research",
-  clogId: "coordinator",
-});
-
-log("start", `Research query: "${query}"`);
-await ocean.signal(coordinatorRunId, { type: "query", text: query });
-
-let tasks: Task[] = [];
-let lastSeq = 0;
-let round = 0;
-let done = false;
-
-while (!done) {
+while (!session.done) {
   await advanceAll();
 
   const events = await ocean.readEvents({
     scope: { kind: "global" },
-    afterSeq: lastSeq,
+    afterSeq: session.lastSeq,
   });
 
-  // Index-based loop: handlers may push new events onto the array
   for (let i = 0; i < events.length; i++) {
     const evt = events[i];
-    lastSeq = evt.seq;
+    session.lastSeq = evt.seq;
     const payload = evt.payload as any;
 
     switch (evt.type) {
@@ -107,27 +223,25 @@ while (!done) {
             question: task.question,
           });
 
-          tasks.push({
+          session.tasks.push({
             id: task.id,
             question: task.question,
             runId,
             done: false,
           });
         }
-        // Advance the newly created researcher runs
         await advanceAll();
 
-        // Append any new events (e.g. findings) for processing
         const newEvents = await ocean.readEvents({
           scope: { kind: "global" },
-          afterSeq: lastSeq,
+          afterSeq: session.lastSeq,
         });
         events.push(...newEvents);
         break;
       }
 
       case "research.finding": {
-        const task = tasks.find((t) => t.id === payload.taskId);
+        const task = session.tasks.find((t) => t.id === payload.taskId);
         if (task) {
           task.finding = payload.finding;
           task.done = true;
@@ -140,7 +254,7 @@ while (!done) {
       }
 
       case "research.followup": {
-        const task = tasks.find((t) => t.id === payload.taskId);
+        const task = session.tasks.find((t) => t.id === payload.taskId);
         if (task) {
           log("followup", `${payload.taskId}: ${payload.direction}`);
           task.done = false;
@@ -158,25 +272,26 @@ while (!done) {
         console.log();
         log("complete", "Research complete!\n");
         console.log(payload.summary);
-        done = true;
+        session.done = true;
         break;
       }
     }
   }
 
+  saveSession(session);
+
   // If all tasks are done and we haven't finished, synthesize
-  if (!done && tasks.length > 0 && tasks.every((t) => t.done)) {
-    // After followups, re-advance researchers and re-read
+  if (!session.done && session.tasks.length > 0 && session.tasks.every((t) => t.done)) {
     await advanceAll();
     const lateEvents = await ocean.readEvents({
       scope: { kind: "global" },
-      afterSeq: lastSeq,
+      afterSeq: session.lastSeq,
     });
     for (const evt of lateEvents) {
-      lastSeq = evt.seq;
+      session.lastSeq = evt.seq;
       const payload = evt.payload as any;
       if (evt.type === "research.finding") {
-        const task = tasks.find((t) => t.id === payload.taskId);
+        const task = session.tasks.find((t) => t.id === payload.taskId);
         if (task) {
           task.finding = payload.finding;
           task.done = true;
@@ -188,13 +303,13 @@ while (!done) {
       }
     }
 
-    round++;
-    const forceComplete = round >= MAX_ROUNDS;
+    session.round++;
+    const forceComplete = session.round >= MAX_ROUNDS;
     if (forceComplete) {
       log("status", `Max rounds (${MAX_ROUNDS}) reached, forcing synthesis.`);
     }
 
-    const findings = tasks
+    const findings = session.tasks
       .filter((t) => t.finding)
       .map((t) => ({
         taskId: t.id,
@@ -202,11 +317,15 @@ while (!done) {
         finding: t.finding!,
       }));
 
-    await ocean.signal(coordinatorRunId, {
+    await ocean.signal(session.coordinatorRunId, {
       type: "synthesize",
       query,
       findings,
       forceComplete,
     });
+
+    saveSession(session);
   }
 }
+
+saveSession(session);

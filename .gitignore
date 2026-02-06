@@ -50,5 +50,6 @@ storybook-static
 
 ocean/db/drizzle/
 
-# Chat example
+# Example session files
 .chat-session
+.research-session
