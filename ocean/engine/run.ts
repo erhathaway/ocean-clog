@@ -140,6 +140,16 @@ export async function acquireRun(
   };
 }
 
+/**
+ * Clear pending_input in the DB after acquiring the run.
+ * The caller already captured the value from the acquireRun snapshot.
+ * This allows applyOutcome("ok") to detect genuinely new signals
+ * that arrive while the handler is executing.
+ */
+export async function consumePendingInput(db: SqlClient, runId: string): Promise<void> {
+  await db.update(runs).set({ pending_input: null }).where(eq(runs.run_id, runId));
+}
+
 export async function releaseRun(
   db: SqlClient,
   runId: string,

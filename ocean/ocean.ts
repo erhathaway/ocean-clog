@@ -3,7 +3,7 @@ import { enableForeignKeys } from "./db/db.js";
 import { migrate } from "drizzle-orm/libsql/migrator";
 import type { Clog, TickOutcome } from "./clogs/types.js";
 import { ClogRegistry } from "./clogs/registry.js";
-import { createRun, getRun, signalRun, acquireRun, releaseRun } from "./engine/run.js";
+import { createRun, getRun, signalRun, acquireRun, releaseRun, consumePendingInput } from "./engine/run.js";
 import type { RunRow } from "./engine/run.js";
 import { beginTickEntity } from "./engine/tick.js";
 import { randomId } from "./core/ids.js";
@@ -88,13 +88,10 @@ function backoffMs(attempt: number): number {
 async function applyOutcome(db: SqlClient, run: RunRow, outcome: TickOutcome): Promise<void> {
   switch (outcome.status) {
     case "ok": {
-      // Check if a *new* signal arrived during processing.
-      // Compare the fresh DB value against what the handler received.
+      // pending_input was cleared by consumePendingInput() after acquireRun.
+      // If non-null now, a new signal arrived during processing.
       const freshRow = await getRun(db, run.run_id);
-      const freshInput = freshRow?.pending_input ?? null;
-      const consumedInput = run.pending_input ?? null;
-      const hasNewInput = freshInput != null
-        && JSON.stringify(freshInput) !== JSON.stringify(consumedInput);
+      const hasNewInput = freshRow?.pending_input != null;
       await releaseRun(db, run.run_id, {
         status: hasNewInput ? "pending" : "idle",
         attempt: 0,
@@ -145,11 +142,17 @@ async function applyOutcome(db: SqlClient, run: RunRow, outcome: TickOutcome): P
           pending_input: null,
         });
       } else {
+        // Restore consumed input so retry gets the same input.
+        // If a new signal arrived during processing, it takes precedence
+        // (signalRun already wrote the new value + flipped to pending).
+        const freshRow = await getRun(db, run.run_id);
+        const hasNewSignal = freshRow?.pending_input != null;
         await releaseRun(db, run.run_id, {
-          status: "waiting",
-          attempt: nextAttempt,
-          wake_at: nowMs() + backoffMs(nextAttempt),
-          last_error: outcome.error,
+          status: hasNewSignal ? "pending" : "waiting",
+          attempt: hasNewSignal ? 0 : nextAttempt,
+          wake_at: hasNewSignal ? null : nowMs() + backoffMs(nextAttempt),
+          last_error: hasNewSignal ? null : outcome.error,
+          pending_input: hasNewSignal ? undefined : run.pending_input,
         });
       }
       break;
@@ -261,6 +264,13 @@ export function createOcean(opts: OceanOptions): Ocean {
 
       const run = await acquireRun(opts.db, instanceId, lockMs);
       if (!run) return { advanced: 0, results: [] };
+
+      // Clear pending_input in the DB now that we've captured it in `run`.
+      // This lets applyOutcome detect genuinely new signals that arrive
+      // while the handler is executing.
+      if (run.pending_input != null) {
+        await consumePendingInput(opts.db, run.run_id);
+      }
 
       const handler = registry.getAdvanceHandler(run.clog_id);
       if (!handler) {
