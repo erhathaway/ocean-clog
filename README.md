@@ -37,6 +37,9 @@ That's the whole execution model.
 
 ### Ocean (the runtime)
 
+> see [./ocean/README.md](./ocean) for details
+
+
 Ocean provides the execution substrate:
 
 **Runs** — A durable state machine. One per conversation, workflow, or task.
