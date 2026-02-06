@@ -47,3 +47,5 @@ storybook-static
 .vscode/*
 !.vscode/settings.json
 !.vscode/extensions.json
+
+ocean/db/drizzle/
