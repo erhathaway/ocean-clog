@@ -18,7 +18,7 @@ Most agent frameworks assume you have a long-running server. That's fine until:
 
 Ocean Clog starts from a different premise: **everything is durable by default**. State is in the database. Progress happens in bounded ticks. The audit log captures every event. If your process dies, pick up exactly where you left off.
 
-No Redis. No message queues. No background workers. One database and your clogs.
+No Redis. No message queues. No background workers. One database and your clogs riding on Ocean.
 
 ## How it works
 
